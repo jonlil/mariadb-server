@@ -1648,8 +1648,12 @@ public:
   ORDER *order, *group_list, *proc_param; //hold parameters of mysql_select
   COND *conds;                            // ---"---
   Item *conds_history;                    // store WHERE for explain
-  COND *outer_ref_cond;       ///<part of conds containing only outer references
-  COND *pseudo_bits_cond;     // part of conds containing special bita
+  /*
+    Conjuncts of conds checked once for each execution, before the join
+    reads a table that is not const.  Each refers to a pseudo table in
+    PSEUDO_TABLE_BITS and to no table that is not const.
+  */
+  COND *outer_ref_cond;
   TABLE_LIST *tables_list;           ///<hold 'tables' parameter of mysql_select
   List<TABLE_LIST> *join_list;       ///< list of joined tables in reverse order
   COND_EQUAL *cond_equal;
