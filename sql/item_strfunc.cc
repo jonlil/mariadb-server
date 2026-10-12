@@ -1,6 +1,6 @@
 /*
    Copyright (c) 2000, 2017, Oracle and/or its affiliates.
-   Copyright (c) 2009, 2022, MariaDB Corporation.
+   Copyright (c) 2009, 2026, MariaDB plc.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -3625,6 +3625,7 @@ String *Item_func_rpad::val_str(String *str)
   longlong byte_count;
   String *res= args[0]->val_str(str);
   String *rpad= arg_count == 2 ? &pad_str : args[2]->val_str(&pad_str);
+  CHARSET_INFO *cs= collation.collation;
 
   if (!res || args[1]->null_value || !rpad || 
       ((count < 0) && !args[1]->unsigned_flag))
@@ -3639,29 +3640,17 @@ String *Item_func_rpad::val_str(String *str)
   /* Set here so that rest of code sees out-of-bound value as such. */
   if ((ulonglong) count > INT_MAX32)
     count= INT_MAX32;
-  /*
-    There is one exception not handled (intentionally) by the character set
-    aggregation code. If one string is strong side and is binary, and
-    another one is weak side and is a multi-byte character string,
-    then we need to operate on the second string in terms on bytes when
-    calling ::numchars() and ::charpos(), rather than in terms of characters.
-    Lets substitute its character set to binary.
-  */
-  if (collation.collation == &my_charset_bin)
-  {
-    res->set_charset(&my_charset_bin);
-    rpad->set_charset(&my_charset_bin);
-  }
 
-  if (count <= (res_char_length= res->numchars()))
+  if (count <= (res_char_length= cs->numchars(res->ptr(), res->end())))
   {                                             // String to pad is big enough
-    int len= res->charpos((int) count);
+    int len= cs->charpos(res->ptr(), res->end(), (size_t) count);
     res= copy_if_not_alloced(str, res, len);
     res->length(len);                           // Shorten result if longer
+    res->set_charset(cs);
     return (res);
   }
 
-  byte_count= count * collation.collation->mbmaxlen;
+  byte_count= count * cs->mbmaxlen;
   {
     THD *thd= current_thd;
     if ((ulonglong) byte_count > thd->variables.max_allowed_packet)
@@ -3676,19 +3665,23 @@ String *Item_func_rpad::val_str(String *str)
 
   if (arg_count == 3)
   {
-    if (args[2]->null_value || !(pad_char_length= rpad->numchars()))
+    if (args[2]->null_value ||
+        !(pad_char_length= cs->numchars(rpad->ptr(), rpad->end())))
       goto err;
   }
   else
     pad_char_length= 1; // Implicit space
 
-  res_byte_length= res->length();	/* Must be done before alloc_buffer */
+  /* Must be done before alloc_buffer */
+  res_byte_length= res->charset() == cs ? res->length()
+                   : cs->charpos(res->ptr(), res->end(), res_char_length);
   if (!(res= alloc_buffer(res,str,&tmp_value, (ulong) byte_count)))
     goto err;
 
   to= (char*) res->ptr()+res_byte_length;
   ptr_pad=rpad->ptr();
-  pad_byte_length= rpad->length();
+  pad_byte_length= rpad->charset() == cs ? rpad->length()
+                   : cs->charpos(rpad->ptr(), rpad->end(), pad_char_length);
   count-= res_char_length;
   for ( ; (uint32) count > pad_char_length; count-= pad_char_length)
   {
@@ -3697,11 +3690,12 @@ String *Item_func_rpad::val_str(String *str)
   }
   if (count)
   {
-    pad_byte_length= rpad->charpos((int) count);
+    pad_byte_length= cs->charpos(rpad->ptr(), rpad->end(), (size_t) count);
     memcpy(to,ptr_pad,(size_t) pad_byte_length);
     to+= pad_byte_length;
   }
   res->length((uint) (to- (char*) res->ptr()));
+  res->set_charset(cs);
   return (res);
 
  err:
