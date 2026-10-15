@@ -112,8 +112,6 @@ static my_bool ignore_table_data(const uchar *hash_key, size_t len);
 static void add_load_option(DYNAMIC_STRING *str, const char *option,
                              const char *option_value);
 static ulong find_set(TYPELIB *, const char *, size_t, char **, uint *);
-static char *alloc_query_str(size_t size);
-
 static void field_escape(DYNAMIC_STRING* in, const char *from);
 static my_bool  verbose= 0, opt_no_create_info= 0, opt_no_data= 0, opt_no_data_med= 1,
                 quick= 1, extended_insert= 1,
@@ -166,7 +164,6 @@ static const char *opt_compatible_mode_str= 0;
 static char **defaults_argv= 0;
 static char compatible_mode_normal_str[255];
 /* Server supports character_set_results session variable? */
-static my_bool server_supports_switching_charsets= TRUE;
 static ulong opt_compatible_mode= 0;
 #define MYSQL_OPT_MASTER_DATA_EFFECTIVE_SQL 1
 #define MYSQL_OPT_MASTER_DATA_COMMENTED_SQL 2
@@ -243,19 +240,19 @@ const char *default_dbug_option="d:t:o,/tmp/mariadb-dump.trace";
 my_bool seen_views= 0;
 const char *compatible_mode_names[]=
 {
-  "MYSQL323", "MYSQL40", "POSTGRESQL", "ORACLE", "MSSQL", "DB2",
+  "POSTGRESQL", "ORACLE", "MSSQL", "DB2",
   "MAXDB", "NO_KEY_OPTIONS", "NO_TABLE_OPTIONS", "NO_FIELD_OPTIONS",
   "ANSI",
   NullS
 };
 #define MASK_ANSI_QUOTES \
 (\
- (1U<<2)  | /* POSTGRESQL */\
- (1U<<3)  | /* ORACLE     */\
- (1U<<4)  | /* MSSQL      */\
- (1U<<5)  | /* DB2        */\
- (1U<<6)  | /* MAXDB      */\
- (1U<<10)   /* ANSI       */\
+ (1U<<0)  | /* POSTGRESQL */\
+ (1U<<1)  | /* ORACLE     */\
+ (1U<<2)  | /* MSSQL      */\
+ (1U<<3)  | /* DB2        */\
+ (1U<<4)  | /* MAXDB      */\
+ (1U<<8)    /* ANSI       */\
 )
 TYPELIB compatible_mode_typelib= CREATE_TYPELIB_FOR(compatible_mode_names);
 
@@ -309,10 +306,10 @@ static struct my_option my_long_options[] =
   {"compatible", OPT_COMPATIBLE,
    "Change the dump to be compatible with a given mode. By default tables "
    "are dumped in a format optimized for MariaDB. Legal modes are: ansi, "
-   "mysql323, mysql40, postgresql, oracle, mssql, db2, maxdb, no_key_options, "
+   "postgresql, oracle, mssql, db2, maxdb, no_key_options, "
    "no_table_options, no_field_options. One can use several modes separated "
-   "by commas. Note: Requires MariaDB server version 4.1.0 or higher. "
-   "This option is ignored with earlier server versions.",
+   "by commas. With any mode, SET and ALTER TABLE ... KEYS statements are "
+   "written as /*!40101 ... */ comments, which other database systems ignore.",
    (char**) &opt_compatible_mode_str, (char**) &opt_compatible_mode_str, 0,
    GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
   {"compact", OPT_COMPACT,
@@ -371,9 +368,9 @@ static struct my_option my_long_options[] =
    GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
 
   {"disable-keys", 'K',
-   "'/*!40000 ALTER TABLE tb_name DISABLE KEYS */; and '/*!40000 ALTER "
-   "TABLE tb_name ENABLE KEYS */; will be put in the output.", &opt_disable_keys,
-   &opt_disable_keys, 0, GET_BOOL, NO_ARG, 1, 0, 0, 0, 0, 0},
+   "'ALTER TABLE tb_name DISABLE KEYS;' and 'ALTER "
+   "TABLE tb_name ENABLE KEYS;' will be put in the output.",
+   &opt_disable_keys, &opt_disable_keys, 0, GET_BOOL, NO_ARG, 1, 0, 0, 0, 0, 0},
   {"dump-date", 0, "Put a dump date to the end of the output.",
    &opt_dump_date, &opt_dump_date, 0, GET_BOOL, NO_ARG, 1, 0, 0, 0, 0, 0},
   {"dump-history", 'H', "Dump system-versioned tables with history (only for "
@@ -787,6 +784,43 @@ static const char *fix_for_comment(const char *ident)
 }
 
 
+/*
+  Print SET / ALTER TABLE ... KEYS statements, one per line.
+  With --compatible each statement is wrapped in a versioned executable
+  comment, so that a non-MariaDB target ignores it.
+*/
+static void fprint_stmts(FILE *sql_file, const char *fmt, ...)
+  ATTRIBUTE_FORMAT(printf, 2, 3);
+
+static void fprint_stmts(FILE *sql_file, const char *fmt, ...)
+{
+  char buf[8192];
+  va_list args;
+  va_start(args, fmt);
+  my_vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+
+  if (!opt_compatible_mode)
+  {
+    fputs(buf, sql_file);
+    return;
+  }
+  for (const char *p= buf; *p; )
+  {
+    const char *nl= strchr(p, '\n');
+    size_t len= nl ? (size_t) (nl - p) : strlen(p);
+    if (len > 1 && p[0] != '/' && p[len - 1] == ';')
+      fprintf(sql_file, "/*!40101 %.*s */;", (int) (len - 1), p);
+    else
+      fprintf(sql_file, "%.*s", (int) len, p);
+    if (!nl)
+      break;
+    fputc('\n', sql_file);
+    p= nl + 1;
+  }
+}
+
+
 static void write_header(FILE *sql_file, const char *db_name)
 {
   if (opt_xml)
@@ -824,28 +858,28 @@ static void write_header(FILE *sql_file, const char *db_name)
           "\n/*M!100101 SET LOCAL SQL_LOG_OFF=0, LOCAL LOG_SLOW_QUERY=0 */;");
 
       if (opt_set_charset)
-        fprintf(sql_file,
-          "\n/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;"
-          "\n/*!40101 SET @OLD_CHARACTER_SET_RESULTS=@@CHARACTER_SET_RESULTS */;"
-          "\n/*!40101 SET @OLD_COLLATION_CONNECTION=@@COLLATION_CONNECTION */;"
-          "\n/*!40101 SET NAMES %s */;\n",default_charset);
+        fprint_stmts(sql_file,
+          "\nSET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT;"
+          "\nSET @OLD_CHARACTER_SET_RESULTS=@@CHARACTER_SET_RESULTS;"
+          "\nSET @OLD_COLLATION_CONNECTION=@@COLLATION_CONNECTION;"
+          "\nSET NAMES %s;\n",default_charset);
 
       if (opt_tz_utc)
       {
-        fprintf(sql_file, "/*!40103 SET @OLD_TIME_ZONE=@@TIME_ZONE */;\n");
-        fprintf(sql_file, "/*!40103 SET TIME_ZONE='+00:00' */;\n");
+        fprint_stmts(sql_file, "SET @OLD_TIME_ZONE=@@TIME_ZONE;\n");
+        fprint_stmts(sql_file, "SET TIME_ZONE='+00:00';\n");
       }
 
       if (!multi_file_output)
       {
         /* We don't need unique checks as the table is created just before */
-        fprintf(md_result_file,
-          "/*!40014 SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS, UNIQUE_CHECKS=0 */;\n");
-        fprintf(md_result_file,
-          "/*!40014 SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0 */;\n");
+        fprint_stmts(md_result_file,
+          "SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS, UNIQUE_CHECKS=0;\n");
+        fprint_stmts(md_result_file,
+          "SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0;\n");
       }
-      fprintf(sql_file,
-              "/*!40101 SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='%s%s%s' */;\n"
+      fprint_stmts(sql_file,
+              "SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='%s%s%s';\n"
               "/*M!100616 SET @OLD_NOTE_VERBOSITY=@@NOTE_VERBOSITY, NOTE_VERBOSITY=0 */;\n",
               multi_file_output?"":"NO_AUTO_VALUE_ON_ZERO",
               compatible_mode_normal_str[0]==0?"":",",
@@ -866,24 +900,24 @@ static void write_footer(FILE *sql_file)
   else if (!opt_compact)
   {
     if (opt_tz_utc)
-      fprintf(sql_file,"/*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;\n");
+      fprint_stmts(sql_file,"SET TIME_ZONE=@OLD_TIME_ZONE;\n");
 
-    fprintf(sql_file,"\n/*!40101 SET SQL_MODE=@OLD_SQL_MODE */;\n");
+    fprint_stmts(sql_file,"\nSET SQL_MODE=@OLD_SQL_MODE;\n");
     if (!multi_file_output)
     {
-      fprintf(md_result_file,"\
-/*!40014 SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS */;\n");
+      fprint_stmts(md_result_file,"\
+SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS;\n");
       if (!opt_no_create_info)
       {
-        fprintf(md_result_file,"\
-/*!40014 SET UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS */;\n");
+        fprint_stmts(md_result_file,"\
+SET UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS;\n");
       }
     }
     if (opt_set_charset)
-      fprintf(sql_file,
-"/*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;\n"
-"/*!40101 SET CHARACTER_SET_RESULTS=@OLD_CHARACTER_SET_RESULTS */;\n"
-"/*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;\n");
+      fprint_stmts(sql_file,
+"SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT;\n"
+"SET CHARACTER_SET_RESULTS=@OLD_CHARACTER_SET_RESULTS;\n"
+"SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION;\n");
     fprintf(sql_file,
             "/*M!100616 SET NOTE_VERBOSITY=@OLD_NOTE_VERBOSITY */;\n");
     fputs("\n", sql_file);
@@ -1722,23 +1756,6 @@ get_gtid_pos(char *out_gtid_pos, int master)
   return (found != 1);
 }
 
-
-static char *my_case_str(const char *str,
-                         size_t str_len,
-                         const char *token,
-                         uint token_len)
-{
-  my_match_t match;
-
-  uint status= my_ci_instr(&my_charset_latin1,
-                           str, str_len,
-                           token, token_len,
-                           &match, 1);
-
-  return status ? (char *) str + match.end : NULL;
-}
-
-
 static int switch_db_collation(FILE *sql_file,
                                const char *db_name,
                                const char *current_db_cl_name,
@@ -1756,7 +1773,7 @@ static int switch_db_collation(FILE *sql_file,
       return 1;
 
     fprintf(sql_file,
-            "ALTER DATABASE %s CHARACTER SET %s COLLATE %s ;\n",
+            "ALTER DATABASE %s CHARACTER SET %s COLLATE %s;\n",
             (const char *) quoted_db_name,
             (const char *) db_cl->cs_name.str,
             (const char *) db_cl->coll_name.str);
@@ -1785,7 +1802,7 @@ static int restore_db_collation(FILE *sql_file,
     return 1;
 
   fprintf(sql_file,
-          "ALTER DATABASE %s CHARACTER SET %s COLLATE %s ;\n",
+          "ALTER DATABASE %s CHARACTER SET %s COLLATE %s;\n",
           (const char *) quoted_db_name,
           (const char *) db_cl->cs_name.str,
           (const char *) db_cl->coll_name.str);
@@ -1799,13 +1816,13 @@ static void switch_cs_variables(FILE *sql_file,
                                 const char *character_set_results,
                                 const char *collation_connection)
 {
-  fprintf(sql_file,
-          "/*!50003 SET @saved_cs_client      = @@character_set_client */ ;\n"
-          "/*!50003 SET @saved_cs_results     = @@character_set_results */ ;\n"
-          "/*!50003 SET @saved_col_connection = @@collation_connection */ ;\n"
-          "/*!50003 SET character_set_client  = %s */ ;\n"
-          "/*!50003 SET character_set_results = %s */ ;\n"
-          "/*!50003 SET collation_connection  = %s */ ;\n",
+  fprint_stmts(sql_file,
+          "SET @saved_cs_client      = @@character_set_client;\n"
+          "SET @saved_cs_results     = @@character_set_results;\n"
+          "SET @saved_col_connection = @@collation_connection;\n"
+          "SET character_set_client  = %s;\n"
+          "SET character_set_results = %s;\n"
+          "SET collation_connection  = %s;\n",
           (const char *) character_set_client,
           (const char *) character_set_results,
           (const char *) collation_connection);
@@ -1814,42 +1831,42 @@ static void switch_cs_variables(FILE *sql_file,
 
 static void restore_cs_variables(FILE *sql_file)
 {
-  fprintf(sql_file,
-          "/*!50003 SET character_set_client  = @saved_cs_client */ ;\n"
-          "/*!50003 SET character_set_results = @saved_cs_results */ ;\n"
-          "/*!50003 SET collation_connection  = @saved_col_connection */ ;\n");
+  fprint_stmts(sql_file,
+          "SET character_set_client  = @saved_cs_client;\n"
+          "SET character_set_results = @saved_cs_results;\n"
+          "SET collation_connection  = @saved_col_connection;\n");
 }
 
 
 static void switch_sql_mode(FILE *sql_file, const char *sql_mode)
 {
-  fprintf(sql_file,
-          "/*!50003 SET @saved_sql_mode       = @@sql_mode */ ;\n"
-          "/*!50003 SET sql_mode              = '%s' */ ;\n",
+  fprint_stmts(sql_file,
+          "SET @saved_sql_mode       = @@sql_mode;\n"
+          "SET sql_mode              = '%s';\n",
           (const char *) sql_mode);
 }
 
 
 static void restore_sql_mode(FILE *sql_file)
 {
-  fprintf(sql_file,
-          "/*!50003 SET sql_mode              = @saved_sql_mode */ ;\n");
+  fprint_stmts(sql_file,
+          "SET sql_mode              = @saved_sql_mode;\n");
 }
 
 
 static void switch_time_zone(FILE *sql_file, const char *time_zone)
 {
-  fprintf(sql_file,
-          "/*!50003 SET @saved_time_zone      = @@time_zone */ ;\n"
-          "/*!50003 SET time_zone             = '%s' */ ;\n",
+  fprint_stmts(sql_file,
+          "SET @saved_time_zone      = @@time_zone;\n"
+          "SET time_zone             = '%s';\n",
           (const char *) time_zone);
 }
 
 
 static void restore_time_zone(FILE *sql_file)
 {
-  fprintf(sql_file,
-          "/*!50003 SET time_zone             = @saved_time_zone */ ;\n");
+  fprint_stmts(sql_file,
+          "SET time_zone             = @saved_time_zone;\n");
 }
 
 
@@ -1873,10 +1890,6 @@ static int switch_character_set_results(MYSQL *mysql, const char *cs_name)
   if (!strcmp(cs_name, MYSQL_AUTODETECT_CHARSET_NAME))
     cs_name= (char *)my_default_csname();
 
-  /* Server lacks facility.  This is not an error, by arbitrary decision . */
-  if (!server_supports_switching_charsets)
-    return FALSE;
-
   query_length= my_snprintf(query_buffer,
                             sizeof (query_buffer),
                             "SET SESSION character_set_results = '%s'",
@@ -1885,72 +1898,6 @@ static int switch_character_set_results(MYSQL *mysql, const char *cs_name)
   return mysql_real_query(mysql, query_buffer, (ulong)query_length);
 }
 
-/**
-  Rewrite statement, enclosing DEFINER clause in version-specific comment.
-
-  This function parses any CREATE statement and encloses DEFINER-clause in
-  version-specific comment:
-    input query:     CREATE DEFINER=a@b FUNCTION ...
-    rewritten query: CREATE * / / *!50020 DEFINER=a@b * / / *!50003 FUNCTION ...
-
-  @note This function will go away when WL#3995 is implemented.
-
-  @param[in] stmt_str                 CREATE statement string.
-  @param[in] stmt_length              Length of the stmt_str.
-  @param[in] definer_version_str      Minimal MySQL version number when
-                                      DEFINER clause is supported in the
-                                      given statement.
-  @param[in] definer_version_length   Length of definer_version_str.
-  @param[in] stmt_version_str         Minimal MySQL version number when the
-                                      given statement is supported.
-  @param[in] stmt_version_length      Length of stmt_version_str.
-  @param[in] keyword_str              Keyword to look for after CREATE.
-  @param[in] keyword_length           Length of keyword_str.
-
-  @return pointer to the new allocated query string.
-*/
-
-static char *cover_definer_clause(const char *stmt_str,
-                                  size_t stmt_length,
-                                  const char *definer_version_str,
-                                  uint definer_version_length,
-                                  const char *stmt_version_str,
-                                  uint stmt_version_length,
-                                  const char *keyword_str,
-                                  uint keyword_length)
-{
-  char *definer_begin= my_case_str(stmt_str, stmt_length,
-                                   C_STRING_WITH_LEN(" DEFINER"));
-  char *definer_end= NULL;
-
-  char *query_str= NULL;
-  char *query_ptr;
-
-  if (!definer_begin)
-    return NULL;
-
-  definer_end= my_case_str(definer_begin, strlen(definer_begin),
-                           keyword_str, keyword_length);
-
-  if (!definer_end)
-    return NULL;
-
-  /*
-    Allocate memory for new query string: original string
-    from SHOW statement and version-specific comments.
-  */
-  query_str= alloc_query_str(stmt_length + 23);
-
-  query_ptr= strnmov(query_str, stmt_str, definer_begin - stmt_str);
-  query_ptr= strnmov(query_ptr, C_STRING_WITH_LEN("*/ /*!"));
-  query_ptr= strnmov(query_ptr, definer_version_str, definer_version_length);
-  query_ptr= strnmov(query_ptr, definer_begin, definer_end - definer_begin);
-  query_ptr= strnmov(query_ptr, C_STRING_WITH_LEN("*/ /*!"));
-  query_ptr= strnmov(query_ptr, stmt_version_str, stmt_version_length);
-  query_ptr= strxmov(query_ptr, definer_end, NullS);
-
-  return query_str;
-}
 
 
 static char *format_fs_safe_filename(const char *from, char *to, size_t to_size)
@@ -2119,22 +2066,13 @@ static MYSQL* connect_to_db(char *host, char *user,char *passwd)
     goto err;
   }
 
-  if ((mysql_get_server_version(con) < 40100) ||
-      (opt_compatible_mode & 3))
-  {
-    /* Don't dump SET NAMES with a pre-4.1 server (bug#7997).  */
-    opt_set_charset= 0;
-
-    /* Don't switch charsets for 4.1 and earlier.  (bug#34192). */
-    server_supports_switching_charsets= FALSE;
-  } 
   /*
     As we're going to set SQL_MODE, it would be lost on reconnect, so we
     cannot reconnect.
   */
   reconnect= 0;
   mysql_options(con, MYSQL_OPT_RECONNECT, &reconnect);
-  my_snprintf(buff, sizeof(buff), "/*!40100 SET @@SQL_MODE='%s' */",
+  my_snprintf(buff, sizeof(buff), "SET @@SQL_MODE='%s'",
               compatible_mode_normal_str);
   if (mysql_query_with_error_report(con, 0, buff))
     goto err;
@@ -2145,7 +2083,7 @@ static MYSQL* connect_to_db(char *host, char *user,char *passwd)
   if (opt_tz_utc)
   {
     if (mysql_query_with_error_report(con, 0,
-                                    "/*!40103 SET TIME_ZONE='+00:00' */"))
+                                    "SET TIME_ZONE='+00:00'"))
       goto err;
   }
 
@@ -2689,7 +2627,7 @@ static uint dump_events_for_db(char *db)
       fputs("\t<events>\n", sql_file);
     else
     {
-      fprintf(sql_file, "/*!50106 SET @save_time_zone= @@TIME_ZONE */ ;\n");
+      fprint_stmts(sql_file, "SET @save_time_zone= @@TIME_ZONE;\n");
 
       /* Get database collation. */
 
@@ -2725,10 +2663,8 @@ static uint dump_events_for_db(char *db)
         */
         if (strlen(row[3]) != 0)
         {
-          char *query_str;
-
           if (opt_drop)
-            fprintf(sql_file, "/*!50106 DROP EVENT IF EXISTS %s */;\n", 
+            fprintf(sql_file, "DROP EVENT IF EXISTS %s;\n",
                 event_name);
 
           if (mysql_num_fields(event_res) >= 7)
@@ -2764,17 +2700,11 @@ static uint dump_events_for_db(char *db)
 
           switch_time_zone(sql_file, row[2]);
 
-          query_str= cover_definer_clause(row[3], strlen(row[3]),
-                                          C_STRING_WITH_LEN("50117"),
-                                          C_STRING_WITH_LEN("50106"),
-                                          C_STRING_WITH_LEN(" EVENT"));
-
           fprintf(sql_file, "DELIMITER ;;\n"
-                  "/*!50106 %s \n*/ ;;\n"
+                  "%s\n;;\n"
                   "DELIMITER ;\n",
-                  (const char *) (query_str != NULL ? query_str : row[3]));
+                  (const char *) row[3]);
 
-          my_free(query_str);
           restore_time_zone(sql_file);
           restore_sql_mode(sql_file);
 
@@ -2801,7 +2731,7 @@ static uint dump_events_for_db(char *db)
     }
     else
     {
-      fprintf(sql_file, "/*!50106 SET TIME_ZONE= @save_time_zone */ ;\n");
+      fprint_stmts(sql_file, "SET TIME_ZONE= @save_time_zone;\n");
     }
 
     if (switch_character_set_results(mysql, default_charset))
@@ -2973,7 +2903,7 @@ static uint dump_routines_for_db(char *db)
             switch_sql_mode(sql_file, row[1]);
 
             if (opt_drop)
-              fprintf(sql_file, "/*!50003 DROP %s IF EXISTS %s */;\n",
+              fprintf(sql_file, "DROP %s IF EXISTS %s;\n",
                       param->routine_type, routine_name);
 
             if (mysql_num_fields(routine_res) >= 6)
@@ -3248,7 +3178,7 @@ static int get_table_structure(const char *table, const char *db, char *table_ty
                    "SET SQL_QUOTE_SHOW_CREATE=%d", opt_quoted || opt_keywords);
   if (!create_options)
     strmov(query_buff+len,
-           "/*!40102 ,SQL_MODE=concat(@@sql_mode, _utf8 ',NO_KEY_OPTIONS,NO_TABLE_OPTIONS,NO_FIELD_OPTIONS') */");
+           ",SQL_MODE=concat(@@sql_mode, _utf8 ',NO_KEY_OPTIONS,NO_TABLE_OPTIONS,NO_FIELD_OPTIONS')");
 
   result_table=     quote_name(table, table_buff, 1);
   opt_quoted_table= quote_name(table, table_buff2, 0);
@@ -3371,16 +3301,15 @@ static int get_table_structure(const char *table, const char *db, char *table_ty
               here we just drop the view.
             */
 
-            fprintf(sql_file, "/*!50001 DROP VIEW IF EXISTS %s*/;\n",
+            fprintf(sql_file, "DROP VIEW IF EXISTS %s;\n",
                     opt_quoted_table);
             check_io(sql_file);
           }
 
-          fprintf(sql_file,
-                  "SET @saved_cs_client     = @@character_set_client;\n"
-                  "SET character_set_client = utf8mb4;\n"
-                  "/*!50001 CREATE VIEW %s AS SELECT\n",
-                  result_table);
+          fprint_stmts(sql_file,
+                       "SET @saved_cs_client     = @@character_set_client;\n"
+                       "SET character_set_client = utf8mb4;\n");
+          fprintf(sql_file, "CREATE VIEW %s AS SELECT\n", result_table);
 
           /*
             Get first row, following loop will prepend comma - keeps from
@@ -3404,9 +3333,9 @@ static int get_table_structure(const char *table, const char *db, char *table_ty
                     quote_name(row[0], name_buff, 0));
           }
 
-          fprintf(sql_file,
-                  " */;\n"
-                  "SET character_set_client = @saved_cs_client;\n");
+          fputs(";\n", sql_file);
+          fprint_stmts(sql_file,
+                       "SET character_set_client = @saved_cs_client;\n");
 
           check_io(sql_file);
         }
@@ -3436,22 +3365,14 @@ static int get_table_structure(const char *table, const char *db, char *table_ty
         dynstr_append_checked(&create_table_str,
           s3_engine_ptr + sizeof(s3_engine_token) - 1);
       }
-      if (opt_compatible_mode & 3)
-      {
-        fprintf(sql_file,
-                is_log_table ? "CREATE TABLE IF NOT EXISTS %s;\n" : "%s;\n",
-                create_table_str.str);
-      }
-      else
-      {
-        fprintf(sql_file,
-                "/*!40101 SET @saved_cs_client     = @@character_set_client */;\n"
-                "/*!40101 SET character_set_client = utf8mb4 */;\n"
-                "%s%s;\n"
-                "/*!40101 SET character_set_client = @saved_cs_client */;\n",
-                is_log_table ? "CREATE TABLE IF NOT EXISTS " : "",
-                create_table_str.str);
-      }
+      fprint_stmts(sql_file,
+                   "SET @saved_cs_client     = @@character_set_client;\n"
+                   "SET character_set_client = utf8mb4;\n");
+      fprintf(sql_file, "%s%s;\n",
+              is_log_table ? "CREATE TABLE IF NOT EXISTS " : "",
+              create_table_str.str);
+      fprint_stmts(sql_file,
+                   "SET character_set_client = @saved_cs_client;\n");
 
       check_io(sql_file);
       if (create_table_str.str != row[1])
@@ -3734,16 +3655,16 @@ static void dump_trigger_old(FILE *sql_file, MYSQL_RES *show_triggers_rs,
           "--\n");
 
   if (opt_compact)
-    fprintf(sql_file, "/*!50003 SET @OLD_SQL_MODE=@@SQL_MODE*/;\n");
+    fprintf(sql_file, "SET @OLD_SQL_MODE=@@SQL_MODE;\n");
 
   if (opt_drop_trigger)
-    fprintf(sql_file, "/*!50032 DROP TRIGGER IF EXISTS %s */;\n",
+    fprintf(sql_file, "DROP TRIGGER IF EXISTS %s;\n",
           quote_name((*show_trigger_row)[0], name_buff, 0));
 
   fprintf(sql_file,
           "DELIMITER ;;\n"
-          "/*!50003 SET SESSION SQL_MODE='%s' */;;\n"
-          "/*!50003 CREATE */ ",
+          "SET SESSION SQL_MODE='%s';;\n"
+          "CREATE ",
           (*show_trigger_row)[6]);
 
   if (mysql_num_fields(show_triggers_rs) > 7)
@@ -3768,13 +3689,13 @@ static void dump_trigger_old(FILE *sql_file, MYSQL_RES *show_triggers_rs,
                host_name_str, &host_name_len);
 
     fprintf(sql_file,
-            "/*!50017 DEFINER=%s@%s */ ",
+            "DEFINER=%s@%s ",
             quote_name(user_name_str, quoted_user_name_str, FALSE),
             quote_name(host_name_str, quoted_host_name_str, FALSE));
   }
 
   fprintf(sql_file,
-          "/*!50003 TRIGGER %s %s %s ON %s FOR EACH ROW%s%s */;;\n"
+          "TRIGGER %s %s %s ON %s FOR EACH ROW%s%s;;\n"
           "DELIMITER ;\n",
           quote_name((*show_trigger_row)[0], name_buff, 0), /* Trigger */
           (*show_trigger_row)[4], /* Timing */
@@ -3784,7 +3705,7 @@ static void dump_trigger_old(FILE *sql_file, MYSQL_RES *show_triggers_rs,
           (*show_trigger_row)[3] /* Statement */);
 
   if (opt_compact)
-    fprintf(sql_file, "/*!50003 SET SESSION SQL_MODE=@OLD_SQL_MODE */;\n");
+    fprintf(sql_file, "SET SESSION SQL_MODE=@OLD_SQL_MODE;\n");
 
   DBUG_VOID_RETURN;
 }
@@ -3794,7 +3715,6 @@ static int dump_trigger(FILE *sql_file, MYSQL_RES *show_create_trigger_rs,
                         const char *db_cl_name)
 {
   MYSQL_ROW row;
-  char *query_str;
   char name_buff[NAME_LEN*4+3];
   int db_cl_altered= FALSE;
 
@@ -3822,20 +3742,14 @@ static int dump_trigger(FILE *sql_file, MYSQL_RES *show_create_trigger_rs,
     switch_sql_mode(sql_file, row[1]);
 
     if (opt_drop_trigger)
-      fprintf(sql_file, "/*!50032 DROP TRIGGER IF EXISTS %s */;\n",
+      fprintf(sql_file, "DROP TRIGGER IF EXISTS %s;\n",
           quote_name(row[0],name_buff,0));
 
-    query_str= cover_definer_clause(row[2], strlen(row[2]),
-                                    C_STRING_WITH_LEN("50017"),
-                                    C_STRING_WITH_LEN("50003"),
-                                    C_STRING_WITH_LEN(" TRIGGER"));
     fprintf(sql_file,
             "DELIMITER ;;\n"
-            "/*!50003 %s \n*/;;\n"
+            "%s\n;;\n"
             "DELIMITER ;\n",
-            (const char *) (query_str != NULL ? query_str : row[2]));
-
-    my_free(query_str);
+            (const char *) row[2]);
 
     restore_sql_mode(sql_file);
     restore_cs_variables(sql_file);
@@ -4032,19 +3946,6 @@ static void field_escape(DYNAMIC_STRING* in, const char *from)
   dynstr_append_checked(in, "'");
 }
 
-
-
-static char *alloc_query_str(size_t size)
-{
-  char *query;
-
-  if (!(query= (char*) my_malloc(PSI_NOT_INSTRUMENTED, size, MYF(MY_WME))))
-    die(EX_MYSQLERR, "Couldn't allocate a query string.");
-
-  return query;
-}
-
-
 static void vers_append_system_time(DYNAMIC_STRING* query_string)
 {
   if (opt_dump_history)
@@ -4194,17 +4095,16 @@ static void dump_table(const char *table, const char *db, const uchar *hash_key,
     to_unix_path(filename);
 
     /* now build the query string */
-    dynstr_append_checked(&query_string, "SELECT /*!40001 SQL_NO_CACHE */ ");
+    dynstr_append_checked(&query_string, "SELECT SQL_NO_CACHE ");
     dynstr_append_checked(&query_string, select_field_names.str);
     dynstr_append_checked(&query_string, " INTO OUTFILE '");
     dynstr_append_checked(&query_string, filename);
     dynstr_append_checked(&query_string, "'");
 
-    dynstr_append_checked(&query_string, " /*!50138 CHARACTER SET ");
+    dynstr_append_checked(&query_string, " CHARACTER SET ");
     dynstr_append_checked(&query_string, default_charset == mysql_universal_client_charset ?
                                          my_charset_bin.coll_name.str : /* backward compatibility */
                                          default_charset);
-    dynstr_append_checked(&query_string, " */");
 
     if (fields_terminated || enclosed || opt_enclosed || escaped)
       dynstr_append_checked(&query_string, " FIELDS");
@@ -4276,7 +4176,7 @@ static void dump_table(const char *table, const char *db, const uchar *hash_key,
                   "\n--\n-- Dumping data for table %s\n--\n",
                   fix_for_comment(result_table));
     
-    dynstr_append_checked(&query_string, "SELECT /*!40001 SQL_NO_CACHE */ ");
+    dynstr_append_checked(&query_string, "SELECT SQL_NO_CACHE ");
     dynstr_append_checked(&query_string, select_field_names.str);
     dynstr_append_checked(&query_string, " FROM ");
     dynstr_append_checked(&query_string, result_table);
@@ -4351,7 +4251,7 @@ static void dump_table(const char *table, const char *db, const uchar *hash_key,
     /* Moved disable keys to after lock per bug 15977 */
     if (opt_disable_keys)
     {
-      fprintf(md_result_file, "/*!40000 ALTER TABLE %s DISABLE KEYS */;\n",
+      fprint_stmts(md_result_file, "ALTER TABLE %s DISABLE KEYS;\n",
 	      opt_quoted_table);
       check_io(md_result_file);
     }
@@ -4636,7 +4536,7 @@ static void dump_table(const char *table, const char *db, const uchar *hash_key,
     /* Moved enable keys to before unlock per bug 15977 */
     if (opt_disable_keys)
     {
-      fprintf(md_result_file,"/*!40000 ALTER TABLE %s ENABLE KEYS */;\n",
+      fprint_stmts(md_result_file,"ALTER TABLE %s ENABLE KEYS;\n",
               opt_quoted_table);
       check_io(md_result_file);
     }
@@ -5567,8 +5467,8 @@ static int init_dumping_mysql_tables(char *qdatabase)
   DBUG_ENTER("init_dumping_mysql_tables");
 
   if (opt_drop_database)
-    fprintf(md_result_file,
-            "\n/*!50106 SET @save_log_output=@@LOG_OUTPUT*/;\n"
+    fprint_stmts(md_result_file,
+            "\nSET @save_log_output=@@LOG_OUTPUT;\n"
             "/*M!100203 EXECUTE IMMEDIATE IF(@@LOG_OUTPUT='TABLE' AND (@@LOG_SLOW_QUERY=1 OR @@GENERAL_LOG=1),"
               "\"SET GLOBAL LOG_OUTPUT='NONE'\", \"DO 0\") */;\n");
 
@@ -5592,8 +5492,8 @@ static void dump_first_mysql_tables(char *database)
                 "error for 'slow_log' table\n");
   /* general and slow query logs exist now */
   if (opt_drop_database)
-    fprintf(md_result_file,
-            "\n/*!50106 SET GLOBAL LOG_OUTPUT=@save_log_output*/;\n\n");
+    fprint_stmts(md_result_file,
+            "\nSET GLOBAL LOG_OUTPUT=@save_log_output;\n\n");
   DBUG_VOID_RETURN;
 }
 
@@ -5624,30 +5524,24 @@ int init_dumping_tables(char *qdatabase)
                 "SHOW CREATE DATABASE IF NOT EXISTS %s",
                 qdatabase);
 
-    if (mysql_query(mysql, qbuf) || !(dbinfo = mysql_store_result(mysql)))
+    dbinfo= NULL;
+    if (mysql_query(mysql, qbuf) || !(dbinfo= mysql_store_result(mysql)))
     {
-      /* Old server version, dump generic CREATE DATABASE */
-      if (opt_drop_database)
-        fprintf(md_result_file,
-                "\n/*!40000 DROP DATABASE IF EXISTS %s*/;\n",
-                qdatabase);
-      fprintf(md_result_file,
-              "\nCREATE DATABASE /*!32312 IF NOT EXISTS*/ %s;\n",
-              qdatabase);
+      fprintf(stderr, "%s: Warning: SHOW CREATE DATABASE failed for %s: %s; "
+              "dumping CREATE DATABASE without charset and collation\n",
+              my_progname_short, qdatabase, mysql_error(mysql));
     }
-    else
+    if (opt_drop_database)
+      fprintf(md_result_file, "\nDROP DATABASE IF EXISTS %s;\n", qdatabase);
+    if (dbinfo)
     {
-      if (opt_drop_database)
-        fprintf(md_result_file,
-                "\n/*!40000 DROP DATABASE IF EXISTS %s*/;\n",
-                qdatabase);
-      row = mysql_fetch_row(dbinfo);
-      if (row[1])
-      {
-        fprintf(md_result_file,"\n%s;\n",row[1]);
-      }
+      if ((row= mysql_fetch_row(dbinfo)) && row[1])
+        fprintf(md_result_file, "\n%s;\n", row[1]);
       mysql_free_result(dbinfo);
     }
+    else
+      fprintf(md_result_file, "\nCREATE DATABASE IF NOT EXISTS %s;\n",
+              qdatabase);
   }
   DBUG_RETURN(0);
 } /* init_dumping_tables */
@@ -5734,7 +5628,7 @@ static int dump_all_tables_in_db(char *database)
       {
         numrows++;
         dynstr_append_checked(&query, quote_name(table, table_buff, 1));
-        dynstr_append_checked(&query, " READ /*!32311 LOCAL */,");
+        dynstr_append_checked(&query, " READ LOCAL,");
       }
     }
     if (numrows && mysql_real_query(mysql, query.str, (ulong)query.length-1))
@@ -5863,7 +5757,7 @@ static int dump_all_tables_in_db(char *database)
   if (flush_privileges && using_mysql_db)
   {
     fprintf(md_result_file,"\n--\n-- Flush Grant Tables \n--\n");
-    fprintf(md_result_file,"\n/*! FLUSH PRIVILEGES */;\n");
+    fprintf(md_result_file,"\nFLUSH PRIVILEGES;\n");
   }
   DBUG_RETURN(0);
 } /* dump_all_tables_in_db */
@@ -5907,7 +5801,7 @@ static my_bool dump_all_views_in_db(char *database)
       {
         numrows++;
         dynstr_append_checked(&query, quote_name(table, table_buff, 1));
-        dynstr_append_checked(&query, " READ /*!32311 LOCAL */,");
+        dynstr_append_checked(&query, " READ LOCAL,");
       }
     }
     if (numrows && mysql_real_query(mysql, query.str, (ulong)query.length-1))
@@ -6085,7 +5979,7 @@ static int dump_selected_tables(char *db, char **table_names, int tables)
       if (lock_tables)
       {
         dynstr_append_checked(&lock_tables_query, quote_name(*pos, table_buff, 1));
-        dynstr_append_checked(&lock_tables_query, " READ /*!32311 LOCAL */,");
+        dynstr_append_checked(&lock_tables_query, " READ LOCAL,");
       }
       pos++;
     }
@@ -6579,7 +6473,7 @@ static int do_flush_tables_read_lock(MYSQL *mysql_con)
   */
   return
     ( mysql_query_with_error_report(mysql_con, 0,
-                                    "FLUSH /*!40101 LOCAL */ TABLES") ||
+                                    "FLUSH LOCAL TABLES") ||
       mysql_query_with_error_report(mysql_con, 0,
                                     "FLUSH TABLES WITH READ LOCK") );
 }
@@ -6633,32 +6527,17 @@ static int start_transaction(MYSQL *mysql_con)
 {
   verbose_msg("-- Starting transaction...\n");
   /*
-    We use BEGIN for old servers. --single-transaction --master-data will fail
-    on old servers, but that's ok as it was already silently broken (it didn't
-    do a consistent read, so better tell people frankly, with the error).
-
     We want the first consistent read to be used for all tables to dump so we
     need the REPEATABLE READ level (not anything lower, for example READ
     COMMITTED would give one new consistent read per dumped table).
   */
-  if ((mysql_get_server_version(mysql_con) < 40100) && opt_master_data)
-  {
-    fprintf(stderr, "-- %s: the combination of --single-transaction and "
-            "--master-data requires a MariaDB server version of at least 4.1 "
-            "(current server's version is %s). %s\n",
-            ignore_errors ? "Warning" : "Error",
-            mysql_con->server_version ? mysql_con->server_version : "unknown",
-            ignore_errors ? "Continuing due to --force, backup may not be consistent across all tables!" : "Aborting.");
-    if (!ignore_errors)
-      exit(EX_MYSQLERR);
-  }
 
   return (mysql_query_with_error_report(mysql_con, 0,
                                         "SET SESSION TRANSACTION ISOLATION "
                                         "LEVEL REPEATABLE READ") ||
           mysql_query_with_error_report(mysql_con, 0,
                                         "START TRANSACTION "
-                                        "/*!40100 WITH CONSISTENT SNAPSHOT */"));
+                                        "WITH CONSISTENT SNAPSHOT"));
 }
 
 
@@ -6887,41 +6766,6 @@ cleanup:
 
 
 /*
-  Replace a substring
-
-  SYNOPSIS
-    replace
-    ds_str      The string to search and perform the replace in
-    search_str  The string to search for
-    search_len  Length of the string to search for
-    replace_str The string to replace with
-    replace_len Length of the string to replace with
-
-  RETURN
-    0 String replaced
-    1 Could not find search_str in str
-*/
-
-static int replace(DYNAMIC_STRING *ds_str,
-                   const char *search_str, size_t search_len,
-                   const char *replace_str, size_t replace_len)
-{
-  DYNAMIC_STRING ds_tmp;
-  const char *start= strstr(ds_str->str, search_str);
-  if (!start)
-    return 1;
-  init_dynamic_string_checked(&ds_tmp, "",
-                      ds_str->length + replace_len, 256);
-  dynstr_append_mem_checked(&ds_tmp, ds_str->str, (uint)(start - ds_str->str));
-  dynstr_append_mem_checked(&ds_tmp, replace_str, (uint)replace_len);
-  dynstr_append_checked(&ds_tmp, start + search_len);
-  dynstr_set_checked(ds_str, ds_tmp.str);
-  dynstr_free(&ds_tmp);
-  return 0;
-}
-
-
-/*
   Getting VIEW structure
 
   SYNOPSIS
@@ -6997,11 +6841,10 @@ static my_bool get_view_structure(char *table, char* db)
                 fix_for_comment(result_table));
 
   /* View might not exist if this view was dumped with --tab. */
-  fprintf(sql_file, "/*!50001 DROP VIEW IF EXISTS %s*/;\n", opt_quoted_table);
+  fprintf(sql_file, "DROP VIEW IF EXISTS %s;\n", opt_quoted_table);
 
   my_snprintf(query, sizeof(query),
-              "SELECT CHECK_OPTION, DEFINER, SECURITY_TYPE, "
-              "       CHARACTER_SET_CLIENT, COLLATION_CONNECTION "
+              "SELECT CHARACTER_SET_CLIENT, COLLATION_CONNECTION "
               "FROM information_schema.views "
               "WHERE table_name=%s AND table_schema=%s",
               quote_for_equal(table, temp_buff2),
@@ -7014,15 +6857,13 @@ static my_bool get_view_structure(char *table, char* db)
        information_schema query fails.
      */
     row= mysql_fetch_row(table_res);
-    fprintf(sql_file, "/*!50001 %s */;\n", row[1]);
+    fprintf(sql_file, "%s;\n", row[1]);
     check_io(sql_file);
     mysql_free_result(table_res);
   }
   else
   {
     ulong *lengths;
-    char search_buf[256], replace_buf[256];
-    size_t search_len, replace_len;
     DYNAMIC_STRING ds_view;
 
     /* Save the result of SHOW CREATE TABLE in ds_view */
@@ -7042,66 +6883,23 @@ static my_bool get_view_structure(char *table, char* db)
       DBUG_RETURN(1);
     }
 
-    lengths= mysql_fetch_lengths(table_res);
-
-    /*
-      "WITH %s CHECK OPTION" is available from 5.0.2
-      Surround it with !50002 comments
-    */
-    if (strcmp(row[0], "NONE"))
-    {
-      search_len= my_snprintf(search_buf, sizeof(search_buf),
-                              "WITH %s CHECK OPTION", row[0]);
-      replace_len= my_snprintf(replace_buf, sizeof(replace_buf),
-                              "*/\n/*!50002 WITH %s CHECK OPTION", row[0]);
-      replace(&ds_view, search_buf, search_len, replace_buf, replace_len);
-    }
-
-    /*
-      "DEFINER=%s SQL SECURITY %s" is available from 5.0.13
-      Surround it with !50013 comments
-    */
-    {
-      size_t     user_name_len;
-      char       user_name_str[USERNAME_LENGTH + 1];
-      char       quoted_user_name_str[USERNAME_LENGTH * 2 + 3];
-      size_t     host_name_len;
-      char       host_name_str[HOSTNAME_LENGTH + 1];
-      char       quoted_host_name_str[HOSTNAME_LENGTH * 2 + 3];
-
-      parse_user(row[1], lengths[1], user_name_str, &user_name_len,
-                 host_name_str, &host_name_len);
-
-      search_len= my_snprintf(search_buf, sizeof(search_buf),
-                    "DEFINER=%s@%s SQL SECURITY %s",
-                    quote_name(user_name_str, quoted_user_name_str, FALSE),
-                    quote_name(host_name_str, quoted_host_name_str, FALSE),
-                    row[2]);
-      replace_len= my_snprintf(replace_buf, sizeof(replace_buf),
-                    "*/\n/*!50013 DEFINER=%s@%s SQL SECURITY %s */\n/*!50001",
-                    quote_name(user_name_str, quoted_user_name_str, FALSE),
-                    quote_name(host_name_str, quoted_host_name_str, FALSE),
-                    row[2]);
-      replace(&ds_view, search_buf, search_len, replace_buf, replace_len);
-    }
-
     /* Dump view structure to file */
 
-    fprintf(sql_file,
-            "/*!50001 SET @saved_cs_client          = @@character_set_client */;\n"
-            "/*!50001 SET @saved_cs_results         = @@character_set_results */;\n"
-            "/*!50001 SET @saved_col_connection     = @@collation_connection */;\n"
-            "/*!50001 SET character_set_client      = %s */;\n"
-            "/*!50001 SET character_set_results     = %s */;\n"
-            "/*!50001 SET collation_connection      = %s */;\n"
-            "/*!50001 %s */;\n"
-            "/*!50001 SET character_set_client      = @saved_cs_client */;\n"
-            "/*!50001 SET character_set_results     = @saved_cs_results */;\n"
-            "/*!50001 SET collation_connection      = @saved_col_connection */;\n",
-            (const char *) row[3],
-            (const char *) row[3],
-            (const char *) row[4],
-            (const char *) ds_view.str);
+    fprint_stmts(sql_file,
+                 "SET @saved_cs_client          = @@character_set_client;\n"
+                 "SET @saved_cs_results         = @@character_set_results;\n"
+                 "SET @saved_col_connection     = @@collation_connection;\n"
+                 "SET character_set_client      = %s;\n"
+                 "SET character_set_results     = %s;\n"
+                 "SET collation_connection      = %s;\n",
+                 (const char *) row[0],
+                 (const char *) row[0],
+                 (const char *) row[1]);
+    fprintf(sql_file, "%s;\n", (const char *) ds_view.str);
+    fprint_stmts(sql_file,
+                 "SET character_set_client      = @saved_cs_client;\n"
+                 "SET character_set_results     = @saved_cs_results;\n"
+                 "SET collation_connection      = @saved_col_connection;\n");
 
     check_io(sql_file);
     mysql_free_result(table_res);

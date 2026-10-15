@@ -452,12 +452,10 @@ options\&.
 .\" compatible option: mariadb-dump
 \fB\-\-compatible=\fR\fB\fIname\fR\fR
 .sp
-Produce output that is more compatible with other database systems or with older MySQL servers\&. The value of
+Produce output that is more compatible with other database systems\&. The value of
 \fIname\fR
 can be
 ansi,
-mysql323,
-mysql40,
 postgresql,
 oracle,
 mssql,
@@ -470,6 +468,14 @@ no_field_options\&. To use several values, separate them by commas\&. These valu
 This option does not guarantee compatibility with other servers\&. It only enables those SQL mode values that are currently available for making dump output more compatible\&. For example,
 \fB\-\-compatible=oracle\fR
 does not map data types to Oracle types or use Oracle comment syntax\&.
+.sp
+With any of these values,
+SET
+and
+ALTER TABLE \&... KEYS
+statements are written as
+/*!40101 \&... */
+comments, which other database systems ignore\&.
 .sp
 .RE
 .sp
@@ -767,9 +773,9 @@ options that \fB\-\-tab\fR supports are also supported by \fB\-\-dir\fR, in part
 For each table, surround the
 INSERT
 statements with
-/*!40000 ALTER TABLE \fItbl_name\fR DISABLE KEYS */;
+ALTER TABLE \fItbl_name\fR DISABLE KEYS;
 and
-/*!40000 ALTER TABLE \fItbl_name\fR ENABLE KEYS */;
+ALTER TABLE \fItbl_name\fR ENABLE KEYS;
 statements\&. This makes loading the dump file faster because the indexes are created after all rows are inserted\&. This option is effective only for nonunique indexes of
 MyISAM
 tables\&.
